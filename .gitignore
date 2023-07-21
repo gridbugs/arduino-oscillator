@@ -1,0 +1,7 @@
+*.o
+*.hex
+*.elf
+.include_paths.txt
+compile_commands.json
+.cache
+periods.h

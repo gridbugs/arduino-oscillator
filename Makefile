@@ -24,7 +24,7 @@ periods.h : mk_periods.py
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -rf *.o *.elf
+	rm -rf *.o *.elf periods.h
 
 $(COMPILE_COMMANDS):
 	$(TOOLS_DIR)/compile_commands_with_extra_include_paths.sh > $@
