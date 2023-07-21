@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <avr/io.h>
+#include <stdint.h>
 #include "periods.h"
 
 // The arduino clock is 16Mhz and the USART0 divides this clock rate by 16
@@ -79,19 +80,59 @@ int timer_match_check_and_clear(void) {
     }
 }
 
+typedef struct {
+    uint8_t sine;
+    uint8_t triangle;
+    uint8_t saw;
+    uint8_t pulse;
+} channels_t;
+
+channels_t make_channels(void) {
+    return (channels_t) {
+        .sine = 0,
+        .triangle = 0,
+        .saw = 0,
+        .pulse = 0,
+    };
+}
+
+void write_channels(channels_t* channels) {
+    // 2 bits unused, 5 bits from sine, 1 bit from triangle
+    PORTD = (channels->sine << 2) | ((channels->triangle & 0x1) << 7);
+    // 4 bits from triangle, 1 bit from pulse, 1 bit from saw
+    PORTB = (channels->triangle >> 1) | (channels->pulse << 4) | ((channels->saw & 0x1) << 5);
+    // 4 bits from saw
+    PORTC = channels->saw >> 1;
+}
+
 int main(void) {
     timer_init();
     ADC_init();
     USART0_init();
     printf("\r\nHello, World!\r\n");
 
+    DDRD |= 0xFC; // leave the low two bits for UART TX and RX
+    DDRB |= 0x3F; // leave the top two bits as they don't have pins
+    DDRC |= 0x0F; // only the bottom 4 pins are used
+
     uint16_t count = 0;
 
     uint16_t adc6 = ADC_read_discarding_first(6);
     uint16_t adc7 = ADC_read_discarding_first(7);
 
+    channels_t channels = make_channels();
+
     while (1) {
         while (!timer_match_check_and_clear());
+
+        if ((count & 0xFF) == 0) {
+            channels.saw = (channels.saw + 1) % 32;
+            channels.triangle = (channels.saw + 1) % 32;
+            channels.sine = (channels.saw + 1) % 32;
+            channels.pulse = !channels.pulse;
+        }
+
+        write_channels(&channels);
 
         // Spread ADC interactions out over several frames. We don't care about
         // the latency of ADC updates and a single ADC read takes longer than
@@ -126,9 +167,9 @@ int main(void) {
                 adc7 = ADC_complete_read();
                 break;
         }
-        if ((count & 0xFF) == 0) {
-            printf("%04d %04d\n\r", adc6, adc7);
-        }
+        //if ((count & 0xFF) == 0) {
+        //    printf("%04d %04d\n\r", adc6, adc7);
+        //}
         count += 1;
     }
 
