@@ -38,21 +38,17 @@ void timer_init(void) {
     OCR1B = 0xFFFF;
 }
 
-
 void ADC_init(void) {
     PRR &= ~(1 << PRADC); // disable power reduction ADC bit
-    ADMUX = 0; // use AREF pin for reference voltage, right adjust the result, select ADC0 channel
     ADCSRA = (1 << ADEN); // enable the ADC
     DIDR0 = 0; // enable all the digital IO pins with the ADC. We'll just use channels 6 and 7.
 }
 
-void ADC_start_read(uint8_t channel) {
-    // This also clears the control bits in ADMUX which should be 0 anyway.
-    // Doing this in two stages (clearing the channel bits and then or-ing in
-    // the new channel bits seems to blend the value at ADC0 with the intended
-    // ADC channel so we do it in one stage by writing the channel directly to
-    // the ADC.
-    ADMUX = (channel & 0xF);
+void ADC_set_channel(uint8_t channel) {
+    ADMUX = (1 << REFS0) | channel;
+}
+
+void ADC_start_read(void) {
     ADCSRA |= (1 << ADSC); // start the conversion
 }
 
@@ -64,8 +60,14 @@ uint16_t ADC_complete_read(void) {
 }
 
 uint16_t ADC_read(uint8_t channel) {
-    ADC_start_read(channel);
+    ADC_set_channel(channel);
+    ADC_start_read();
     return ADC_complete_read();
+}
+
+uint16_t ADC_read_discarding_first(uint8_t channel) {
+    ADC_read(channel);
+    return ADC_read(channel);
 }
 
 int timer_match_check_and_clear(void) {
@@ -83,10 +85,51 @@ int main(void) {
     USART0_init();
     printf("\r\nHello, World!\r\n");
 
+    uint16_t count = 0;
+
+    uint16_t adc6 = ADC_read_discarding_first(6);
+    uint16_t adc7 = ADC_read_discarding_first(7);
+
     while (1) {
-        uint16_t adc6 = ADC_read(6);
-        uint16_t adc7 = ADC_read(7);
-        printf("%d %d\n\r", adc6, adc7);
+        while (!timer_match_check_and_clear());
+
+        // Spread ADC interactions out over several frames. We don't care about
+        // the latency of ADC updates and a single ADC read takes longer than
+        // we can afford to spend mid-frame. Further, rapidly reading the ADC
+        // after switching channels results in reading residual values from the
+        // previous channel. This seems to be mitigated by doing a dummy read
+        // and discarding its value before doing the "real" read after each
+        // channel switch.
+        switch (count & 0xFF) {
+            case 0:
+                ADC_set_channel(6);
+                ADC_start_read();
+                break;
+            case 0x20:
+                // discard first result since channel switch
+                ADC_complete_read();
+                ADC_start_read();
+                break;
+            case 0x40:
+                adc6 = ADC_complete_read();
+                break;
+            case 0x60:
+                ADC_set_channel(7);
+                ADC_start_read();
+                break;
+            case 0x80:
+                // discard first result since channel switch
+                ADC_complete_read();
+                ADC_start_read();
+                break;
+            case 0xA0:
+                adc7 = ADC_complete_read();
+                break;
+        }
+        if ((count & 0xFF) == 0) {
+            printf("%04d %04d\n\r", adc6, adc7);
+        }
+        count += 1;
     }
 
     return 0;
