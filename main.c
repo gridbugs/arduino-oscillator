@@ -2,6 +2,7 @@
 #include <avr/io.h>
 #include <stdint.h>
 #include "periods.h"
+#include "sine.h"
 
 // The arduino clock is 16Mhz and the USART0 divides this clock rate by 16
 #define USART0_CLOCK_HZ 1000000
@@ -35,8 +36,21 @@ void timer_init(void) {
     TCCR1B |= (1 << CS10);
     TCCR1B &= ~(1 << CS11);
     TCCR1B &= ~(1 << CS12);
-    OCR1A = 160; // resets at 100khz
+    OCR1A = 32000; // initially reset after 2ms
     OCR1B = 0xFFFF;
+}
+
+void timer_set_output_compare(uint16_t value) {
+    OCR1A = value;
+}
+
+int timer_match_check_and_clear(void) {
+    if (TIFR1 & (1 << OCF1A)) {
+        TIFR1 |= (1 << OCF1A);
+        return 1;
+    } else {
+        return 0;
+    }
 }
 
 void ADC_init(void) {
@@ -69,15 +83,6 @@ uint16_t ADC_read(uint8_t channel) {
 uint16_t ADC_read_discarding_first(uint8_t channel) {
     ADC_read(channel);
     return ADC_read(channel);
-}
-
-int timer_match_check_and_clear(void) {
-    if (TIFR1 & (1 << OCF1A)) {
-        TIFR1 |= (1 << OCF1A);
-        return 1;
-    } else {
-        return 0;
-    }
 }
 
 typedef struct {
@@ -125,12 +130,24 @@ int main(void) {
     while (1) {
         while (!timer_match_check_and_clear());
 
-        if ((count & 0xFF) == 0) {
+        timer_set_output_compare(periods[adc7 >> 1]);
+
+        if (count % 2 == 0) {
             channels.saw = (channels.saw + 1) % 32;
-            channels.triangle = (channels.saw + 1) % 32;
-            channels.sine = (channels.saw + 1) % 32;
-            channels.pulse = !channels.pulse;
         }
+        if ((count & (1 << 5)) && channels.triangle > 0) {
+            channels.triangle--;
+        } else if (channels.triangle < 31) {
+            channels.triangle++;
+        }
+
+        channels.sine = sine[count % SINE_N_SAMPLES];
+
+        uint16_t pwm_compare = adc6 >> 5;
+        if (pwm_compare == 0) {
+            pwm_compare = 1;
+        }
+        channels.pulse = (count % SINE_N_SAMPLES) < pwm_compare;
 
         write_channels(&channels);
 

@@ -17,14 +17,17 @@ COMPILE_COMMANDS=compile_commands.json
 $(TARGET).elf: $(OBJ) periods.h
 	$(CC) $(CFLAGS) $(OBJ) -o $@
 
-periods.h : mk_periods.py
-	python3 mk_periods.py > $@
+periods.h : gen.py
+	python3 gen.py --output periods > $@
 
-%.o : %.c periods.h
+sine.h : gen.py
+	python3 gen.py --output sine > $@
+
+%.o : %.c periods.h sine.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -rf *.o *.elf periods.h
+	rm -rf *.o *.elf periods.h sine.h
 
 $(COMPILE_COMMANDS):
 	$(TOOLS_DIR)/compile_commands_with_extra_include_paths.sh > $@
