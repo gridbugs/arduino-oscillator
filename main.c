@@ -103,9 +103,9 @@ channels_t make_channels(void) {
 
 void write_channels(channels_t* channels) {
     // 2 bits unused, 5 bits from sine, 1 bit from triangle
-    PORTD = (channels->sine << 2) | ((channels->triangle & 0x1) << 7);
+    PORTD = (channels->sine << 2) | ((channels->triangle & 0x1) << 7) | ((channels->pulse & 0x2) >> 1);
     // 4 bits from triangle, 1 bit from pulse, 1 bit from saw
-    PORTB = (channels->triangle >> 1) | (channels->pulse << 4) | ((channels->saw & 0x1) << 5);
+    PORTB = (channels->triangle >> 1) | ((channels->pulse & 0x1) << 4) | ((channels->saw & 0x1) << 5);
     // 4 bits from saw
     PORTC = channels->saw >> 1;
 }
@@ -116,40 +116,55 @@ int main(void) {
     USART0_init();
     printf("\r\nHello, World!\r\n");
 
-    DDRD |= 0xFC; // leave the low two bits for UART TX and RX
+    DDRD |= 0xFD; // leave PD1 for TX (but still take RX as a digital IO pin)
     DDRB |= 0x3F; // leave the top two bits as they don't have pins
     DDRC |= 0x0F; // only the bottom 4 pins are used
 
     uint16_t count = 0;
+    uint16_t count_detuned = 0;
 
     uint16_t adc6 = ADC_read_discarding_first(6);
     uint16_t adc7 = ADC_read_discarding_first(7);
 
     channels_t channels = make_channels();
+    channels_t channels_detuned = make_channels();
+    channels_t channels_combined = make_channels();
 
     while (1) {
         while (!timer_match_check_and_clear());
 
         timer_set_output_compare(periods[adc7 >> 1]);
 
-        if (count % 2 == 0) {
-            channels.saw = (channels.saw + 1) % 32;
-        }
+        channels.saw = (count / 2) % 32;
+        channels_detuned.saw = (count_detuned / 2) % 32;
+
         if ((count & (1 << 5)) && channels.triangle > 0) {
             channels.triangle--;
         } else if (channels.triangle < 31) {
             channels.triangle++;
         }
+        if ((count_detuned & (1 << 5)) && channels_detuned.triangle > 0) {
+            channels_detuned.triangle--;
+        } else if (channels_detuned.triangle < 31) {
+            channels_detuned.triangle++;
+        }
 
         channels.sine = sine[count % SINE_N_SAMPLES];
+        channels_detuned.sine = sine[count_detuned % SINE_N_SAMPLES];
 
         uint16_t pwm_compare = adc6 >> 5;
         if (pwm_compare == 0) {
             pwm_compare = 1;
         }
         channels.pulse = (count % SINE_N_SAMPLES) < pwm_compare;
+        channels_detuned.pulse = (count_detuned % SINE_N_SAMPLES) < pwm_compare;
 
-        write_channels(&channels);
+        channels_combined.sine = (channels.sine + channels_detuned.sine) / 2;
+        channels_combined.triangle = (channels.triangle + channels_detuned.triangle) / 2;
+        channels_combined.saw = (channels.saw + channels_detuned.saw) / 2;
+        channels_combined.pulse =  channels.pulse + channels_detuned.pulse;
+
+        write_channels(&channels_combined);
 
         // Spread ADC interactions out over several frames. We don't care about
         // the latency of ADC updates and a single ADC read takes longer than
@@ -188,6 +203,9 @@ int main(void) {
         //    printf("%04d %04d\n\r", adc6, adc7);
         //}
         count += 1;
+        if (count % 128 != 0) {
+            count_detuned++;
+        }
     }
 
     return 0;
