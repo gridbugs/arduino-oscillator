@@ -23,7 +23,7 @@ periods.h : gen.py
 sine.h : gen.py
 	python3 gen.py --output sine > $@
 
-%.o : %.c periods.h sine.h
+%.o : %.c low_res.h periods.h sine.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:

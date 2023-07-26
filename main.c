@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <avr/io.h>
 #include <stdint.h>
+#include "low_res.h"
 #include "periods.h"
 #include "sine.h"
 
@@ -56,7 +57,7 @@ int timer_match_check_and_clear(void) {
 void ADC_init(void) {
     PRR &= ~(1 << PRADC); // disable power reduction ADC bit
     ADCSRA = (1 << ADEN); // enable the ADC
-    DIDR0 = 0; // enable all the digital IO pins with the ADC. We'll just use channels 6 and 7.
+    DIDR0 = (1 << ADC5D); // disable digital pin 5
 }
 
 void ADC_set_channel(uint8_t channel) {
@@ -85,29 +86,227 @@ uint16_t ADC_read_discarding_first(uint8_t channel) {
     return ADC_read(channel);
 }
 
-typedef struct {
-    uint8_t sine;
-    uint8_t triangle;
-    uint8_t saw;
-    uint8_t pulse;
-} channels_t;
+uint32_t xorshift32() {
+    static uint32_t state = 0x12345678;
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return state;
+}
 
-channels_t make_channels(void) {
-    return (channels_t) {
-        .sine = 0,
-        .triangle = 0,
-        .saw = 0,
-        .pulse = 0,
+typedef enum {
+    SINE = 0,
+    TRIANGLE,
+    PULSE,
+    SAW,
+    SUPER_SAW,
+    CLIPPED_SAW,
+    CLIPPED_SUPER_SAW,
+    NOISE,
+} waveform_t;
+
+#define ADC_INDEX_WAVEFORM 5
+#define ADC_INDEX_EFFECT 6
+#define ADC_INDEX_FREQUENCY 7
+
+typedef struct {
+    uint16_t waveform;
+    uint16_t effect;
+    uint16_t frequency;
+} dials_t;
+
+dials_t dials_create(void) {
+    return (dials_t) {
+      .waveform = ADC_read_discarding_first(ADC_INDEX_WAVEFORM),
+      .effect = ADC_read_discarding_first(ADC_INDEX_EFFECT),
+      .frequency = ADC_read_discarding_first(ADC_INDEX_FREQUENCY),
     };
 }
 
-void write_channels(channels_t* channels) {
-    // 2 bits unused, 5 bits from sine, 1 bit from triangle
-    PORTD = (channels->sine << 2) | ((channels->triangle & 0x1) << 7) | ((channels->pulse & 0x2) >> 1);
-    // 4 bits from triangle, 1 bit from pulse, 1 bit from saw
-    PORTB = (channels->triangle >> 1) | ((channels->pulse & 0x1) << 4) | ((channels->saw & 0x1) << 5);
-    // 4 bits from saw
-    PORTC = channels->saw >> 1;
+uint16_t dials_period(dials_t* dials) {
+    return periods[dials->frequency >> 1];
+}
+
+waveform_t dials_waveform(dials_t* dials) {
+    return dials->waveform / 128;
+}
+
+void update_dials(dials_t* dials, uint16_t count) {
+    // Spread ADC interactions out over several frames. We don't care about
+    // the latency of ADC updates and a single ADC read takes longer than
+    // we can afford to spend mid-frame. Further, rapidly reading the ADC
+    // after switching channels results in reading residual values from the
+    // previous channel. This seems to be mitigated by doing a dummy read
+    // and discarding its value before doing the "real" read after each
+    // channel switch.
+    switch (count & 0xFF) {
+        case 0:
+            ADC_set_channel(ADC_INDEX_WAVEFORM);
+            ADC_start_read();
+            break;
+        case 0x20:
+            // discard first result since channel switch
+            ADC_complete_read();
+            ADC_start_read();
+            break;
+        case 0x40:
+            dials->waveform = ADC_complete_read();
+            break;
+        case 0x60:
+            ADC_set_channel(ADC_INDEX_EFFECT);
+            ADC_start_read();
+            break;
+        case 0x80:
+            // discard first result since channel switch
+            ADC_complete_read();
+            ADC_start_read();
+            break;
+        case 0xA0:
+            dials->effect = ADC_complete_read();
+            ADC_set_channel(ADC_INDEX_FREQUENCY);
+            ADC_start_read();
+            break;
+        case 0xC0:
+            // discard first result since channel switch
+            ADC_complete_read();
+            ADC_start_read();
+            break;
+        case 0xE0:
+            dials->frequency = ADC_complete_read();
+            break;
+    }
+}
+
+uint8_t sample_sine(uint16_t count) {
+    return sine[count % N_SAMPLES];
+}
+
+uint8_t sample_saw(uint16_t count) {
+    return (count / 2) % 32;
+}
+
+uint8_t sample_clipped_saw(uint16_t count) {
+    uint16_t double_saw = count % 64;
+    if (double_saw < 16) {
+        return 0;
+    } else if (double_saw < 48) {
+        return double_saw - 16;
+    } else {
+        return 31;
+    }
+}
+
+uint8_t sample_pulse(uint16_t count, uint16_t effect) {
+    uint16_t pwm_compare = 32 - (effect >> 5);
+    if ((count % N_SAMPLES) < pwm_compare) {
+        return 0;
+    } else {
+        return 31;
+    }
+}
+
+uint8_t sample_triangle(uint16_t count, uint8_t current) {
+    if ((count & (1 << 5)) && current > 0) {
+        return current - 1;
+    } else if (current < 31) {
+        return current + 1;
+    }
+    return current;
+}
+
+uint8_t sample_noise(void) {
+    return xorshift32();
+}
+
+typedef struct {
+    uint16_t count;
+    uint16_t detuned;
+} count_t;
+
+void count_update(count_t* count) {
+    count->count += 1;
+    if (count->count % 128 != 0) {
+        count->detuned++;
+    }
+}
+
+uint8_t next_sample(dials_t* dials, count_t* count, uint8_t current_sample) {
+    waveform_t waveform = dials_waveform(dials);
+    switch (waveform) {
+        case SINE:
+            return sample_sine(count->count);
+        case TRIANGLE:
+            return sample_triangle(count->count, current_sample);
+        case PULSE:
+            return sample_pulse(count->count, dials->effect);
+        case SAW:
+            return sample_saw(count->count);
+        case SUPER_SAW:
+            return (sample_saw(count->count) + sample_saw(count->detuned)) / 2;
+        case CLIPPED_SAW:
+            return sample_clipped_saw(count->count);
+        case CLIPPED_SUPER_SAW:
+            return (sample_clipped_saw(count->count) + sample_clipped_saw(count->detuned)) / 2;
+        case NOISE:
+            return sample_noise();
+    }
+    return 0;
+}
+
+uint8_t apply_low_res(uint8_t sample, uint16_t effect) {
+    uint16_t low_res_index = effect / 256;
+    switch (low_res_index) {
+        case 0:
+            return sample;
+        case 1:
+            return low_res_16[sample];
+        case 2:
+            return low_res_8[sample];
+        case 3:
+            return low_res_4[sample];
+    }
+    return 0;
+}
+
+void write_sample(uint8_t sample) {
+    PORTC = sample;
+}
+
+void set_waveform_led(waveform_t waveform) {
+    switch (waveform) {
+        case SINE:
+            PORTD = (1 << 2);
+            PORTB = 0;
+            break;
+        case TRIANGLE:
+            PORTD = (1 << 3);
+            PORTB = 0;
+            break;
+        case PULSE:
+            PORTD = (1 << 4);
+            PORTB = 0;
+            break;
+        case SAW:
+            PORTD = (1 << 5);
+            PORTB = 0;
+            break;
+        case SUPER_SAW:
+            PORTD = (1 << 6);
+            PORTB = 0;
+            break;
+        case CLIPPED_SAW:
+            PORTD = (1 << 7);
+            PORTB = 0;
+            break;
+        case CLIPPED_SUPER_SAW:
+            PORTD = 0;
+            PORTB = (1 << 0);
+            break;
+        case NOISE:
+            PORTD = 0;
+            PORTB = (1 << 1);
+            break;
+    }
 }
 
 int main(void) {
@@ -116,96 +315,29 @@ int main(void) {
     USART0_init();
     printf("\r\nHello, World!\r\n");
 
-    DDRD |= 0xFD; // leave PD1 for TX (but still take RX as a digital IO pin)
-    DDRB |= 0x3F; // leave the top two bits as they don't have pins
-    DDRC |= 0x0F; // only the bottom 4 pins are used
+    DDRD |= 0xFC;
+    DDRB |= 0x03;
+    DDRC |= 0x1F;
 
-    uint16_t count = 0;
-    uint16_t count_detuned = 0;
+    count_t count = { 0 };
 
-    uint16_t adc6 = ADC_read_discarding_first(6);
-    uint16_t adc7 = ADC_read_discarding_first(7);
+    dials_t dials = dials_create();
 
-    channels_t channels = make_channels();
-    channels_t channels_detuned = make_channels();
-    channels_t channels_combined = make_channels();
-
+    uint8_t sample = 0;
+    int first = 100;
     while (1) {
         while (!timer_match_check_and_clear());
-
-        timer_set_output_compare(periods[adc7 >> 1]);
-
-        channels.saw = (count / 2) % 32;
-        channels_detuned.saw = (count_detuned / 2) % 32;
-
-        if ((count & (1 << 5)) && channels.triangle > 0) {
-            channels.triangle--;
-        } else if (channels.triangle < 31) {
-            channels.triangle++;
+        timer_set_output_compare(dials_period(&dials));
+        sample = next_sample(&dials, &count, sample);
+        write_sample(apply_low_res(sample, dials.effect));
+        update_dials(&dials, count.count);
+        if (first > 0) {
+            // this delay is because otherwise the wrong LED briefly turns on when the arduino first starts up
+            first--;
+        } else {
+            set_waveform_led(dials_waveform(&dials));
         }
-        if ((count_detuned & (1 << 5)) && channels_detuned.triangle > 0) {
-            channels_detuned.triangle--;
-        } else if (channels_detuned.triangle < 31) {
-            channels_detuned.triangle++;
-        }
-
-        channels.sine = sine[count % SINE_N_SAMPLES];
-        channels_detuned.sine = sine[count_detuned % SINE_N_SAMPLES];
-
-        uint16_t pwm_compare = adc6 >> 5;
-        if (pwm_compare == 0) {
-            pwm_compare = 1;
-        }
-        channels.pulse = (count % SINE_N_SAMPLES) < pwm_compare;
-        channels_detuned.pulse = (count_detuned % SINE_N_SAMPLES) < pwm_compare;
-
-        channels_combined.sine = (channels.sine + channels_detuned.sine) / 2;
-        channels_combined.triangle = (channels.triangle + channels_detuned.triangle) / 2;
-        channels_combined.saw = (channels.saw + channels_detuned.saw) / 2;
-        channels_combined.pulse =  channels.pulse + channels_detuned.pulse;
-
-        write_channels(&channels_combined);
-
-        // Spread ADC interactions out over several frames. We don't care about
-        // the latency of ADC updates and a single ADC read takes longer than
-        // we can afford to spend mid-frame. Further, rapidly reading the ADC
-        // after switching channels results in reading residual values from the
-        // previous channel. This seems to be mitigated by doing a dummy read
-        // and discarding its value before doing the "real" read after each
-        // channel switch.
-        switch (count & 0xFF) {
-            case 0:
-                ADC_set_channel(6);
-                ADC_start_read();
-                break;
-            case 0x20:
-                // discard first result since channel switch
-                ADC_complete_read();
-                ADC_start_read();
-                break;
-            case 0x40:
-                adc6 = ADC_complete_read();
-                break;
-            case 0x60:
-                ADC_set_channel(7);
-                ADC_start_read();
-                break;
-            case 0x80:
-                // discard first result since channel switch
-                ADC_complete_read();
-                ADC_start_read();
-                break;
-            case 0xA0:
-                adc7 = ADC_complete_read();
-                break;
-        }
-        //if ((count & 0xFF) == 0) {
-        //    printf("%04d %04d\n\r", adc6, adc7);
-        //}
-        count += 1;
-        if (count % 128 != 0) {
-            count_detuned++;
-        }
+        count_update(&count);
     }
 
     return 0;
