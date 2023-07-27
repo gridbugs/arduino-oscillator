@@ -220,13 +220,18 @@ uint8_t sample_noise(void) {
 
 typedef struct {
     uint16_t count;
-    uint16_t detuned;
+    uint16_t detuned0;
+    uint16_t detuned1;
 } count_t;
 
 void count_update(count_t* count) {
     count->count += 1;
     if (count->count % 128 != 0) {
-        count->detuned++;
+        count->detuned0++;
+    }
+    count->detuned1++;
+    if (count->count % 128 == 0) {
+        count->detuned1++;
     }
 }
 
@@ -241,12 +246,16 @@ uint8_t next_sample(dials_t* dials, count_t* count, uint8_t current_sample) {
             return sample_pulse(count->count, dials->effect);
         case SAW:
             return sample_saw(count->count);
-        case SUPER_SAW:
-            return (sample_saw(count->count) + sample_saw(count->detuned)) / 2;
+        case SUPER_SAW: {
+            uint16_t detuned_mean = (sample_saw(count->detuned0) + sample_saw(count->detuned1)) / 2;
+            return (sample_saw(count->count) + detuned_mean) / 2;
+        }
         case CLIPPED_SAW:
             return sample_clipped_saw(count->count);
-        case CLIPPED_SUPER_SAW:
-            return (sample_clipped_saw(count->count) + sample_clipped_saw(count->detuned)) / 2;
+        case CLIPPED_SUPER_SAW: {
+            uint16_t detuned_mean = (sample_clipped_saw(count->detuned0) + sample_clipped_saw(count->detuned1)) / 2;
+            return (sample_clipped_saw(count->count) + detuned_mean) / 2;
+        }
         case NOISE:
             return sample_noise();
     }
